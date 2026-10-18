@@ -1,10 +1,23 @@
 /**
  * @file agent.ts
  * @description Core Agent SDK implementation providing an extensible autonomous agent
- * powered by OpenAI Chat Completions, structured reasoning pipelines, and tool execution.
+ * with support for Multi-Step Reasoning, Input & Output Guardrails, Tool Execution Security,
+ * and OpenAI-style Multi-Agent Handoffs.
  */
 
 import { HARNESS_PROMPT, type AgentStepPayload } from "./config.js";
+import {
+    defaultGuardrails,
+    type InputGuardrail,
+    type OutputGuardrail,
+    type ToolGuardrail
+} from "./guardrails.js";
+import {
+    createHandoffTool,
+    isHandoffSignal,
+    type HandoffOptions,
+    type HandoffSignal
+} from "./handoff.js";
 import Openai from 'openai';
 
 /**
@@ -37,19 +50,39 @@ export interface ITool {
 export type Interceptor = (message: IMessage) => void;
 
 /**
+ * Options for configuring an Agent directly without the builder.
+ */
+export interface AgentOptions {
+    /** Name of the agent (e.g. 'Coding Specialist', 'Weather Agent') */
+    name?: string;
+    /** Custom instructions or persona for the agent */
+    instructions?: string;
+    /** List of tools accessible to this agent */
+    tools?: ITool[];
+    /** List of peer agents this agent can hand off tasks to */
+    handoffs?: Array<Agent | { agent: Agent; options?: HandoffOptions }>;
+    /** Input guardrails evaluated before the user prompt reaches the model */
+    inputGuardrails?: InputGuardrail[];
+    /** Output guardrails evaluated before returning the final response */
+    outputGuardrails?: OutputGuardrail[];
+    /** Tool guardrails evaluated before any tool executor is called */
+    toolGuardrails?: ToolGuardrail[];
+    /** OpenAI API key (defaults to process.env.OPENAI_API_KEY) */
+    apiKey?: string;
+    /** OpenAI model identifier (default: 'gpt-4o') */
+    model?: string;
+    /** Maximum reasoning iterations (default: 30) */
+    maxLoops?: number;
+}
+
+/**
  * Helper to safely extract and parse JSON from model responses,
  * stripping markdown code fences if present.
- *
- * @param raw - Raw string output from the LLM.
- * @returns Parsed AgentStepPayload object.
  */
 function parseJSONResponse(raw: string): AgentStepPayload {
     const trimmed = raw.trim();
-
-    // Check if the output is wrapped in markdown code blocks like ```json ... ```
     const codeBlockMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
     const candidate = codeBlockMatch && codeBlockMatch[1] ? codeBlockMatch[1].trim() : trimmed;
-
     return JSON.parse(candidate) as AgentStepPayload;
 }
 
@@ -57,31 +90,35 @@ function parseJSONResponse(raw: string): AgentStepPayload {
  * Fluent builder class for assembling and configuring an `Agent` instance.
  */
 export class AgentBuilder {
+    public name: string = 'Agent';
     public instructions: string | undefined;
-    public toolList: ITool[];
+    public toolList: ITool[] = [];
+    public handoffsList: Array<{ agent: Agent; options?: HandoffOptions }> = [];
+    public inputGuardrails: InputGuardrail[] = [];
+    public outputGuardrails: OutputGuardrail[] = [];
+    public toolGuardrails: ToolGuardrail[] = [];
     public apiKey: string | undefined;
     public model: string = 'gpt-4o';
     public maxLoops: number = 30;
 
-    constructor() {
-        this.toolList = [];
+    /**
+     * Sets the agent's display name.
+     */
+    public setName(name: string): this {
+        this.name = name;
+        return this;
     }
 
     /**
-     * Sets the custom system instructions for the agent.
-     *
-     * @param instructions - High-level system instructions defining the agent's persona.
+     * Sets the system instructions / persona.
      */
     public setInstructions(instructions: string): this {
         this.instructions = instructions;
         return this;
     }
 
-
     /**
-     * Registers a single tool with the agent.
-     *
-     * @param tool - Tool definition to add.
+     * Adds a single tool to the agent.
      */
     public addTool(tool: ITool): this {
         this.toolList.push(tool);
@@ -89,18 +126,14 @@ export class AgentBuilder {
     }
 
     /**
-     * Convenient alias for `addTool`.
-     *
-     * @param tool - Tool definition to add.
+     * Alias for `addTool`.
      */
     public tool(tool: ITool): this {
         return this.addTool(tool);
     }
 
     /**
-     * Registers multiple tools at once.
-     *
-     * @param tools - Array of tools to add.
+     * Adds multiple tools at once.
      */
     public addTools(tools: ITool[]): this {
         this.toolList.push(...tools);
@@ -108,10 +141,66 @@ export class AgentBuilder {
     }
 
     /**
+     * Adds an agent handoff, enabling this agent to delegate to another specialist.
+     */
+    public addHandoff(targetAgent: Agent, options?: HandoffOptions): this {
+        if (options !== undefined) {
+            this.handoffsList.push({ agent: targetAgent, options });
+        } else {
+            this.handoffsList.push({ agent: targetAgent });
+        }
+        return this;
+    }
+
+    /**
+     * Adds multiple agent handoffs.
+     */
+    public addHandoffs(agents: Agent[]): this {
+        for (const agent of agents) {
+            this.addHandoff(agent);
+        }
+        return this;
+    }
+
+    /**
+     * Adds an Input Guardrail to screen or sanitize user prompts.
+     */
+    public addInputGuardrail(guardrail: InputGuardrail): this {
+        this.inputGuardrails.push(guardrail);
+        return this;
+    }
+
+    /**
+     * Adds an Output Guardrail to screen or sanitize LLM responses.
+     */
+    public addOutputGuardrail(guardrail: OutputGuardrail): this {
+        this.outputGuardrails.push(guardrail);
+        return this;
+    }
+
+    /**
+     * Adds a Tool Guardrail to intercept tool invocations before execution.
+     */
+    public addToolGuardrail(guardrail: ToolGuardrail): this {
+        this.toolGuardrails.push(guardrail);
+        return this;
+    }
+
+    /**
+     * Activates the standard production guardrail suite:
+     * - Input: Prompt injection detection & PII masking
+     * - Output: API key / token secret leak detection
+     * - Tools: Destructive CLI command blocker
+     */
+    public useDefaultGuardrails(): this {
+        this.inputGuardrails.push(...defaultGuardrails.inputs);
+        this.outputGuardrails.push(...defaultGuardrails.outputs);
+        this.toolGuardrails.push(...defaultGuardrails.tools);
+        return this;
+    }
+
+    /**
      * Configures a custom OpenAI API key.
-     * If not set, the agent defaults to `process.env.OPENAI_API_KEY`.
-     *
-     * @param apiKey - OpenAI API key.
      */
     public setApiKey(apiKey: string): this {
         this.apiKey = apiKey;
@@ -119,9 +208,7 @@ export class AgentBuilder {
     }
 
     /**
-     * Configures the OpenAI model identifier (default: `'gpt-4o'`).
-     *
-     * @param model - Model name, e.g., 'gpt-4o', 'gpt-4o-mini'.
+     * Sets the OpenAI model identifier (default: 'gpt-4o').
      */
     public setModel(model: string): this {
         this.model = model;
@@ -129,9 +216,7 @@ export class AgentBuilder {
     }
 
     /**
-     * Sets the maximum iterations for the reasoning and tool execution loop (default: 30).
-     *
-     * @param maxLoops - Maximum number of iterations.
+     * Sets the maximum loop iterations (default: 30).
      */
     public setMaxLoops(maxLoops: number): this {
         this.maxLoops = maxLoops;
@@ -139,7 +224,7 @@ export class AgentBuilder {
     }
 
     /**
-     * Builds and initializes a new `Agent` instance.
+     * Builds and returns a new `Agent` instance.
      */
     public build(): Agent {
         return new Agent(this);
@@ -147,10 +232,11 @@ export class AgentBuilder {
 }
 
 /**
- * Autonomous Agent capable of reasoning, planning, and invoking tools
- * across multiple iterations until an answer is produced.
+ * Autonomous Agent capable of multi-step reasoning, tool execution,
+ * multi-agent handoffs, and bidirectional guardrail validation.
  */
 export class Agent {
+    public readonly name: string;
     private instructions: string;
     private messageHistory: IMessage[];
     private toolMap: Map<string, ITool>;
@@ -159,22 +245,74 @@ export class Agent {
     private interceptors: Interceptor[];
     private maxLoops: number;
     private model: string;
+    private inputGuardrails: InputGuardrail[];
+    private outputGuardrails: OutputGuardrail[];
+    private toolGuardrails: ToolGuardrail[];
 
-    constructor(builder: AgentBuilder) {
+    constructor(builderOrOptions?: AgentBuilder | AgentOptions) {
         this.toolMap = new Map();
         this.interceptors = [];
         this.messageHistory = [];
-        this.maxLoops = builder.maxLoops;
-        this.model = builder.model;
-        this.apiKey = builder.apiKey;
 
-        for (const tool of builder.toolList) {
+        let name = 'Agent';
+        let instructions = '';
+        let tools: ITool[] = [];
+        let handoffs: Array<{ agent: Agent; options?: HandoffOptions }> = [];
+        let inputGuards: InputGuardrail[] = [];
+        let outputGuards: OutputGuardrail[] = [];
+        let toolGuards: ToolGuardrail[] = [];
+        let model = 'gpt-4o';
+        let maxLoops = 30;
+        let apiKey: string | undefined;
+
+        if (builderOrOptions instanceof AgentBuilder) {
+            name = builderOrOptions.name;
+            instructions = builderOrOptions.instructions || '';
+            tools = [...builderOrOptions.toolList];
+            handoffs = [...builderOrOptions.handoffsList];
+            inputGuards = [...builderOrOptions.inputGuardrails];
+            outputGuards = [...builderOrOptions.outputGuardrails];
+            toolGuards = [...builderOrOptions.toolGuardrails];
+            model = builderOrOptions.model;
+            maxLoops = builderOrOptions.maxLoops;
+            apiKey = builderOrOptions.apiKey;
+        } else if (builderOrOptions) {
+            name = builderOrOptions.name ?? name;
+            instructions = builderOrOptions.instructions ?? instructions;
+            tools = builderOrOptions.tools ? [...builderOrOptions.tools] : [];
+            if (builderOrOptions.handoffs) {
+                handoffs = builderOrOptions.handoffs.map(h => 'agent' in h ? h : { agent: h });
+            }
+            inputGuards = builderOrOptions.inputGuardrails ? [...builderOrOptions.inputGuardrails] : [];
+            outputGuards = builderOrOptions.outputGuardrails ? [...builderOrOptions.outputGuardrails] : [];
+            toolGuards = builderOrOptions.toolGuardrails ? [...builderOrOptions.toolGuardrails] : [];
+            model = builderOrOptions.model ?? model;
+            maxLoops = builderOrOptions.maxLoops ?? maxLoops;
+            apiKey = builderOrOptions.apiKey;
+        }
+
+        this.name = name;
+        this.model = model;
+        this.maxLoops = maxLoops;
+        this.apiKey = apiKey;
+        this.inputGuardrails = inputGuards;
+        this.outputGuardrails = outputGuards;
+        this.toolGuardrails = toolGuards;
+
+        // Register tools
+        for (const tool of tools) {
             this.toolMap.set(tool.name, tool);
         }
 
-        // Format available tools as a readable reference for the LLM
-        const formattedTools = builder.toolList.length > 0
-            ? builder.toolList.map(t => JSON.stringify({
+        // Register handoff tools
+        for (const { agent: targetAgent, options } of handoffs) {
+            const handoffTool = createHandoffTool(targetAgent, options);
+            this.toolMap.set(handoffTool.name, handoffTool);
+        }
+
+        // Compile tool documentation for the harness prompt
+        const formattedTools = this.toolMap.size > 0
+            ? Array.from(this.toolMap.values()).map(t => JSON.stringify({
                 functionName: t.name,
                 functionDescription: t.description,
                 functionDoc: t.doc ?? 'No signature doc provided'
@@ -184,17 +322,19 @@ export class Agent {
         this.instructions = `
 ${HARNESS_PROMPT}
 
-Agent Persona & Custom Instructions:
-${builder.instructions || 'You are a helpful, accurate, and structured autonomous assistant.'}
+Agent Name:
+${this.name}
 
-Available Tools:
+Agent Persona & Custom Instructions:
+${instructions || 'You are a helpful, accurate, and structured autonomous assistant.'}
+
+Available Tools & Handoffs:
 ${formattedTools}
         `.trim();
     }
 
     /**
      * Lazily initializes and returns the OpenAI client instance.
-     * Throws a descriptive error if no API key is available.
      */
     private getOpenAIClient(): Openai {
         if (!this.openai) {
@@ -218,24 +358,20 @@ ${formattedTools}
 
     /**
      * Attaches an interceptor callback to observe message emissions in real time.
-     *
-     * @param interceptor - Callback function invoked on every message.
      */
     public attachInterceptor(interceptor: Interceptor): void {
         this.interceptors.push(interceptor);
     }
 
     /**
-     * Broadcasts a message to all attached interceptors safely.
-     *
-     * @param message - The message payload to dispatch.
+     * Dispatches a message to all attached interceptors.
      */
     private notifyInterceptors(message: IMessage): void {
         for (const interceptor of this.interceptors) {
             try {
                 interceptor(message);
             } catch (err) {
-                console.error('Error within message interceptor:', err);
+                console.error(`[${this.name}] Error within message interceptor:`, err);
             }
         }
     }
@@ -255,19 +391,57 @@ ${formattedTools}
     }
 
     /**
+     * Sets or imports existing conversation history (useful during handoffs).
+     */
+    public setHistory(history: IMessage[]): void {
+        this.messageHistory = [...history];
+    }
+
+    /**
      * Runs the autonomous reasoning loop for a given user query.
      *
-     * @param query - The user's prompt or question.
-     * @returns Complete message history upon completion or loop termination.
+     * @param query - The user's input prompt.
+     * @param options - Optional run configuration (e.g. existing history from a handoff).
+     * @returns Complete message history upon completion.
      */
-    public async run(query: string): Promise<IMessage[]> {
-        // 1. Record and notify user message
-        const userMessage: IMessage = { role: 'user', content: query };
+    public async run(query: string, options?: { history?: IMessage[] }): Promise<IMessage[]> {
+        if (options?.history) {
+            this.messageHistory = [...options.history];
+        }
+
+        // ====================================================================
+        // 1. INPUT GUARDRAILS
+        // ====================================================================
+        let sanitizedInput = query;
+        for (const guard of this.inputGuardrails) {
+            const check = await guard(sanitizedInput);
+            if (!check.passed) {
+                const rejectionMsg: IMessage = {
+                    role: 'assistant',
+                    content: JSON.stringify({
+                        step: 'OUTPUT',
+                        text: `⚠️ Request Blocked by Security Policy: ${check.reason || 'Input guardrail validation failed.'}`
+                    })
+                };
+                this.messageHistory.push({ role: 'user', content: query });
+                this.messageHistory.push(rejectionMsg);
+                this.notifyInterceptors(rejectionMsg);
+                return this.messageHistory;
+            }
+            if (check.sanitizedText !== undefined) {
+                sanitizedInput = check.sanitizedText;
+            }
+        }
+
+        // Record and broadcast user input
+        const userMessage: IMessage = { role: 'user', content: sanitizedInput };
         this.messageHistory.push(userMessage);
         this.notifyInterceptors(userMessage);
 
+        // ====================================================================
+        // 2. REASONING & EXECUTION LOOP
+        // ====================================================================
         for (let iteration = 0; iteration < this.maxLoops; iteration++) {
-            // 2. Call OpenAI with compiled system prompt and conversation history
             const client = this.getOpenAIClient();
             const llmResponse = await client.chat.completions.create({
                 model: this.model,
@@ -282,12 +456,10 @@ ${formattedTools}
 
             const rawLLMResponse = llmResponse.choices[0]?.message?.content ?? '';
 
-            // 3. Append and notify assistant response
             const assistantMessage: IMessage = { role: 'assistant', content: rawLLMResponse };
             this.messageHistory.push(assistantMessage);
             this.notifyInterceptors(assistantMessage);
 
-            // 4. Safely parse LLM output JSON
             let parsedResult: AgentStepPayload;
             try {
                 parsedResult = parseJSONResponse(rawLLMResponse);
@@ -301,12 +473,36 @@ ${formattedTools}
 
             const step = parsedResult.step ? String(parsedResult.step).trim().toLowerCase() : '';
 
-            // 5. Termination condition: OUTPUT reached
+            // ================================================================
+            // 3. OUTPUT GUARDRAIL EVALUATION
+            // ================================================================
             if (step === 'output') {
+                let finalText = parsedResult.text ?? rawLLMResponse;
+
+                for (const outGuard of this.outputGuardrails) {
+                    const outCheck = await outGuard(finalText);
+                    if (!outCheck.passed) {
+                        finalText = `⚠️ Response Blocked by Output Security Policy: ${outCheck.reason || 'Violation detected.'}`;
+                        break;
+                    }
+                    if (outCheck.sanitizedText !== undefined) {
+                        finalText = outCheck.sanitizedText;
+                    }
+                }
+
+                // If sanitized, update the last assistant message
+                if (finalText !== parsedResult.text) {
+                    parsedResult.text = finalText;
+                    const updatedContent = JSON.stringify(parsedResult);
+                    this.messageHistory[this.messageHistory.length - 1]!.content = updatedContent;
+                }
+
                 return this.messageHistory;
             }
 
-            // 6. Tool execution step: TOOL_REQUEST
+            // ================================================================
+            // 4. TOOL & HANDOFF EXECUTION
+            // ================================================================
             if (step === 'tool_request') {
                 const functionName = parsedResult.functionName ?? '';
                 const input = parsedResult.input ?? '';
@@ -321,14 +517,71 @@ ${formattedTools}
                     continue;
                 }
 
+                // Enforce Tool Execution Guardrails
+                let toolBlocked = false;
+                for (const toolGuard of this.toolGuardrails) {
+                    const guardCheck = await toolGuard(functionName, input);
+                    if (!guardCheck.passed) {
+                        const blockedMsg = `Security Error: ${guardCheck.reason || 'Tool execution was blocked by policy.'}`;
+                        const devBlocked: IMessage = {
+                            role: 'developer',
+                            content: JSON.stringify({
+                                functionName,
+                                input,
+                                error: blockedMsg
+                            })
+                        };
+                        this.messageHistory.push(devBlocked);
+                        this.notifyInterceptors(devBlocked);
+                        toolBlocked = true;
+                        break;
+                    }
+                }
+
+                if (toolBlocked) {
+                    continue;
+                }
+
+                // Execute the tool
                 try {
-                    const toolResult = await tool.executor(input);
+                    const rawToolResult = await tool.executor(input);
+
+                    // Check for Agent Handoff Signal
+                    let parsedSignal: unknown;
+                    try {
+                        parsedSignal = JSON.parse(rawToolResult);
+                    } catch {
+                        parsedSignal = null;
+                    }
+
+                    if (isHandoffSignal(parsedSignal)) {
+                        const signal: HandoffSignal = parsedSignal;
+                        const targetAgent = signal.targetAgent;
+
+                        const handoffNotice: IMessage = {
+                            role: 'developer',
+                            content: `[HANDOFF]: Transferring execution from "${this.name}" to specialist agent "${targetAgent.name}". Context: ${signal.reason ?? 'Delegated task'}`
+                        };
+                        this.messageHistory.push(handoffNotice);
+                        this.notifyInterceptors(handoffNotice);
+
+                        // Attach this agent's interceptors to the target agent so logging continues uninterrupted
+                        for (const interceptor of this.interceptors) {
+                            targetAgent.attachInterceptor(interceptor);
+                        }
+
+                        // Seamlessly transfer conversation history to target agent and execute
+                        const delegatedHistory = signal.passHistory ? [...this.messageHistory] : [];
+                        return await targetAgent.run(signal.input || query, { history: delegatedHistory });
+                    }
+
+                    // Standard tool response
                     const devResponse: IMessage = {
                         role: 'developer',
                         content: JSON.stringify({
                             functionName,
                             input,
-                            toolResult
+                            toolResult: rawToolResult
                         })
                     };
                     this.messageHistory.push(devResponse);
@@ -348,11 +601,9 @@ ${formattedTools}
 
                 continue;
             }
-
-            // 7. Intermediate pipeline steps (INITIAL, THINK, ANALYSE) continue loop to next step
         }
 
-        console.warn(`[Agent] Reached maximum iteration limit of ${this.maxLoops} steps without an OUTPUT step.`);
+        console.warn(`[${this.name}] Reached maximum iteration limit of ${this.maxLoops} steps without an OUTPUT step.`);
         return this.messageHistory;
     }
 }
