@@ -6,26 +6,18 @@
  * Allows agents to seamlessly delegate tasks to specialized peer agents.
  */
 
-import type { Agent, ITool } from "./agent.js";
+import type { IAgent } from '../core/types.js';
+import type { ITool, HandoffOptions } from './types.js';
 
-/**
- * Configuration options for creating an agent handoff.
- */
-export interface HandoffOptions {
-    /** Custom function name for the tool (defaults to `transferTo_<AgentName>`) */
-    toolName?: string;
-    /** Explanation for the LLM of when and why to transfer to this agent */
-    description?: string;
-    /** Whether to pass accumulated conversation history to the target agent (default: true) */
-    passHistory?: boolean;
-}
+export type { HandoffOptions };
+
 
 /**
  * Special marker returned when an agent decides to hand off execution.
  */
 export interface HandoffSignal {
     __isHandoff: true;
-    targetAgent: Agent;
+    targetAgent: IAgent;
     reason?: string;
     input?: string;
     passHistory: boolean;
@@ -45,7 +37,7 @@ export function isHandoffSignal(value: unknown): value is HandoffSignal {
  * @param options - Configuration options for the handoff tool.
  * @returns An `ITool` that can be registered with any `Agent`.
  */
-export function createHandoffTool(targetAgent: Agent, options: HandoffOptions = {}): ITool {
+export function createHandoffTool(targetAgent: IAgent, options: HandoffOptions = {}): ITool {
     const agentName = targetAgent.name || 'SpecialistAgent';
     // Clean identifier for tool name
     const sanitizedName = agentName.replace(/[^a-zA-Z0-9_]/g, '_');

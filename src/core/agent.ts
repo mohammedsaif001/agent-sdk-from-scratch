@@ -1,241 +1,23 @@
 /**
  * @file agent.ts
- * @description Core Agent SDK implementation providing an extensible autonomous agent
- * with support for Multi-Step Reasoning, Input & Output Guardrails, Tool Execution Security,
- * and OpenAI-style Multi-Agent Handoffs.
+ * @description Core autonomous Agent runtime orchestrating multi-step reasoning,
+ * tool execution, guardrail enforcement, and multi-agent handoffs.
  */
 
-import { HARNESS_PROMPT, type AgentStepPayload } from "./config.js";
-import {
-    defaultGuardrails,
-    type InputGuardrail,
-    type OutputGuardrail,
-    type ToolGuardrail
-} from "./guardrails.js";
-import {
-    createHandoffTool,
-    isHandoffSignal,
-    type HandoffOptions,
-    type HandoffSignal
-} from "./handoff.js";
 import Openai from 'openai';
-
-/**
- * Chat message structure exchanged between the user, agent, and tools.
- */
-export interface IMessage {
-    /** The role of the message sender */
-    role: 'user' | 'assistant' | 'developer' | 'system';
-    /** The text content or JSON-encoded payload */
-    content: string;
-}
-
-/**
- * Definition of an executable tool that an agent can invoke during reasoning.
- */
-export interface ITool {
-    /** Unique name identifier for the tool */
-    name: string;
-    /** Human-readable explanation of what the tool does */
-    description: string;
-    /** Optional signature or usage documentation for the tool */
-    doc?: string;
-    /** Function invoked when the agent calls this tool */
-    executor: (input: string) => Promise<string> | string;
-}
-
-/**
- * Callback function to observe and intercept messages as they flow through the agent.
- */
-export type Interceptor = (message: IMessage) => void;
-
-/**
- * Options for configuring an Agent directly without the builder.
- */
-export interface AgentOptions {
-    /** Name of the agent (e.g. 'Coding Specialist', 'Weather Agent') */
-    name?: string;
-    /** Custom instructions or persona for the agent */
-    instructions?: string;
-    /** List of tools accessible to this agent */
-    tools?: ITool[];
-    /** List of peer agents this agent can hand off tasks to */
-    handoffs?: Array<Agent | { agent: Agent; options?: HandoffOptions }>;
-    /** Input guardrails evaluated before the user prompt reaches the model */
-    inputGuardrails?: InputGuardrail[];
-    /** Output guardrails evaluated before returning the final response */
-    outputGuardrails?: OutputGuardrail[];
-    /** Tool guardrails evaluated before any tool executor is called */
-    toolGuardrails?: ToolGuardrail[];
-    /** OpenAI API key (defaults to process.env.OPENAI_API_KEY) */
-    apiKey?: string;
-    /** OpenAI model identifier (default: 'gpt-4o') */
-    model?: string;
-    /** Maximum reasoning iterations (default: 30) */
-    maxLoops?: number;
-}
-
-/**
- * Helper to safely extract and parse JSON from model responses,
- * stripping markdown code fences if present.
- */
-function parseJSONResponse(raw: string): AgentStepPayload {
-    const trimmed = raw.trim();
-    const codeBlockMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    const candidate = codeBlockMatch && codeBlockMatch[1] ? codeBlockMatch[1].trim() : trimmed;
-    return JSON.parse(candidate) as AgentStepPayload;
-}
-
-/**
- * Fluent builder class for assembling and configuring an `Agent` instance.
- */
-export class AgentBuilder {
-    public name: string = 'Agent';
-    public instructions: string | undefined;
-    public toolList: ITool[] = [];
-    public handoffsList: Array<{ agent: Agent; options?: HandoffOptions }> = [];
-    public inputGuardrails: InputGuardrail[] = [];
-    public outputGuardrails: OutputGuardrail[] = [];
-    public toolGuardrails: ToolGuardrail[] = [];
-    public apiKey: string | undefined;
-    public model: string = 'gpt-4o';
-    public maxLoops: number = 30;
-
-    /**
-     * Sets the agent's display name.
-     */
-    public setName(name: string): this {
-        this.name = name;
-        return this;
-    }
-
-    /**
-     * Sets the system instructions / persona.
-     */
-    public setInstructions(instructions: string): this {
-        this.instructions = instructions;
-        return this;
-    }
-
-    /**
-     * Adds a single tool to the agent.
-     */
-    public addTool(tool: ITool): this {
-        this.toolList.push(tool);
-        return this;
-    }
-
-    /**
-     * Alias for `addTool`.
-     */
-    public tool(tool: ITool): this {
-        return this.addTool(tool);
-    }
-
-    /**
-     * Adds multiple tools at once.
-     */
-    public addTools(tools: ITool[]): this {
-        this.toolList.push(...tools);
-        return this;
-    }
-
-    /**
-     * Adds an agent handoff, enabling this agent to delegate to another specialist.
-     */
-    public addHandoff(targetAgent: Agent, options?: HandoffOptions): this {
-        if (options !== undefined) {
-            this.handoffsList.push({ agent: targetAgent, options });
-        } else {
-            this.handoffsList.push({ agent: targetAgent });
-        }
-        return this;
-    }
-
-    /**
-     * Adds multiple agent handoffs.
-     */
-    public addHandoffs(agents: Agent[]): this {
-        for (const agent of agents) {
-            this.addHandoff(agent);
-        }
-        return this;
-    }
-
-    /**
-     * Adds an Input Guardrail to screen or sanitize user prompts.
-     */
-    public addInputGuardrail(guardrail: InputGuardrail): this {
-        this.inputGuardrails.push(guardrail);
-        return this;
-    }
-
-    /**
-     * Adds an Output Guardrail to screen or sanitize LLM responses.
-     */
-    public addOutputGuardrail(guardrail: OutputGuardrail): this {
-        this.outputGuardrails.push(guardrail);
-        return this;
-    }
-
-    /**
-     * Adds a Tool Guardrail to intercept tool invocations before execution.
-     */
-    public addToolGuardrail(guardrail: ToolGuardrail): this {
-        this.toolGuardrails.push(guardrail);
-        return this;
-    }
-
-    /**
-     * Activates the standard production guardrail suite:
-     * - Input: Prompt injection detection & PII masking
-     * - Output: API key / token secret leak detection
-     * - Tools: Destructive CLI command blocker
-     */
-    public useDefaultGuardrails(): this {
-        this.inputGuardrails.push(...defaultGuardrails.inputs);
-        this.outputGuardrails.push(...defaultGuardrails.outputs);
-        this.toolGuardrails.push(...defaultGuardrails.tools);
-        return this;
-    }
-
-    /**
-     * Configures a custom OpenAI API key.
-     */
-    public setApiKey(apiKey: string): this {
-        this.apiKey = apiKey;
-        return this;
-    }
-
-    /**
-     * Sets the OpenAI model identifier (default: 'gpt-4o').
-     */
-    public setModel(model: string): this {
-        this.model = model;
-        return this;
-    }
-
-    /**
-     * Sets the maximum loop iterations (default: 30).
-     */
-    public setMaxLoops(maxLoops: number): this {
-        this.maxLoops = maxLoops;
-        return this;
-    }
-
-    /**
-     * Builds and returns a new `Agent` instance.
-     */
-    public build(): Agent {
-        return new Agent(this);
-    }
-}
+import { HARNESS_PROMPT, formatToolSignatures } from './prompt.js';
+import { parseJSONResponse } from './parser.js';
+import { AgentBuilder } from './builder.js';
+import type { IMessage, AgentStepPayload, Interceptor, AgentOptions, AgentRunOptions, IAgent } from './types.js';
+import type { ITool, HandoffOptions, HandoffSignal } from '../tools/index.js';
+import { createHandoffTool, isHandoffSignal } from '../tools/handoff.js';
+import type { InputGuardrail, OutputGuardrail, ToolGuardrail } from '../guardrails/types.js';
 
 /**
  * Autonomous Agent capable of multi-step reasoning, tool execution,
  * multi-agent handoffs, and bidirectional guardrail validation.
  */
-export class Agent {
+export class Agent implements IAgent {
     public readonly name: string;
     private instructions: string;
     private messageHistory: IMessage[];
@@ -255,9 +37,9 @@ export class Agent {
         this.messageHistory = [];
 
         let name = 'Agent';
-        let instructions = '';
+        let customInstructions = '';
         let tools: ITool[] = [];
-        let handoffs: Array<{ agent: Agent; options?: HandoffOptions }> = [];
+        let handoffs: Array<{ agent: IAgent; options?: HandoffOptions }> = [];
         let inputGuards: InputGuardrail[] = [];
         let outputGuards: OutputGuardrail[] = [];
         let toolGuards: ToolGuardrail[] = [];
@@ -267,7 +49,7 @@ export class Agent {
 
         if (builderOrOptions instanceof AgentBuilder) {
             name = builderOrOptions.name;
-            instructions = builderOrOptions.instructions || '';
+            customInstructions = builderOrOptions.instructions || '';
             tools = [...builderOrOptions.toolList];
             handoffs = [...builderOrOptions.handoffsList];
             inputGuards = [...builderOrOptions.inputGuardrails];
@@ -278,7 +60,7 @@ export class Agent {
             apiKey = builderOrOptions.apiKey;
         } else if (builderOrOptions) {
             name = builderOrOptions.name ?? name;
-            instructions = builderOrOptions.instructions ?? instructions;
+            customInstructions = builderOrOptions.instructions ?? customInstructions;
             tools = builderOrOptions.tools ? [...builderOrOptions.tools] : [];
             if (builderOrOptions.handoffs) {
                 handoffs = builderOrOptions.handoffs.map(h => 'agent' in h ? h : { agent: h });
@@ -299,7 +81,7 @@ export class Agent {
         this.outputGuardrails = outputGuards;
         this.toolGuardrails = toolGuards;
 
-        // Register tools
+        // Register standard tools
         for (const tool of tools) {
             this.toolMap.set(tool.name, tool);
         }
@@ -311,13 +93,7 @@ export class Agent {
         }
 
         // Compile tool documentation for the harness prompt
-        const formattedTools = this.toolMap.size > 0
-            ? Array.from(this.toolMap.values()).map(t => JSON.stringify({
-                functionName: t.name,
-                functionDescription: t.description,
-                functionDoc: t.doc ?? 'No signature doc provided'
-            })).join('\n')
-            : 'None';
+        const formattedTools = formatToolSignatures(this.toolMap.values());
 
         this.instructions = `
 ${HARNESS_PROMPT}
@@ -326,7 +102,7 @@ Agent Name:
 ${this.name}
 
 Agent Persona & Custom Instructions:
-${instructions || 'You are a helpful, accurate, and structured autonomous assistant.'}
+${customInstructions || 'You are a helpful, accurate, and structured autonomous assistant.'}
 
 Available Tools & Handoffs:
 ${formattedTools}
@@ -391,7 +167,7 @@ ${formattedTools}
     }
 
     /**
-     * Sets or imports existing conversation history (useful during handoffs).
+     * Sets or imports existing conversation history.
      */
     public setHistory(history: IMessage[]): void {
         this.messageHistory = [...history];
@@ -399,18 +175,14 @@ ${formattedTools}
 
     /**
      * Runs the autonomous reasoning loop for a given user query.
-     *
-     * @param query - The user's input prompt.
-     * @param options - Optional run configuration (e.g. existing history from a handoff).
-     * @returns Complete message history upon completion.
      */
-    public async run(query: string, options?: { history?: IMessage[] }): Promise<IMessage[]> {
+    public async run(query: string, options?: AgentRunOptions): Promise<IMessage[]> {
         if (options?.history) {
             this.messageHistory = [...options.history];
         }
 
         // ====================================================================
-        // 1. INPUT GUARDRAILS
+        // 1. INPUT GUARDRAILS EVALUATION
         // ====================================================================
         let sanitizedInput = query;
         for (const guard of this.inputGuardrails) {
@@ -565,7 +337,7 @@ ${formattedTools}
                         this.messageHistory.push(handoffNotice);
                         this.notifyInterceptors(handoffNotice);
 
-                        // Attach this agent's interceptors to the target agent so logging continues uninterrupted
+                        // Attach this agent's interceptors to target agent
                         for (const interceptor of this.interceptors) {
                             targetAgent.attachInterceptor(interceptor);
                         }

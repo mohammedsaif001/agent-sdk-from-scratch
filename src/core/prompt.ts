@@ -1,34 +1,9 @@
 /**
- * @file config.ts
- * @description System prompt configuration and pipeline definitions for the Agent SDK.
- * 
- * Defines the core harness prompt that instructs the LLM to execute a structured
- * multi-step reasoning pipeline (INITIAL -> THINK -> ANALYSE -> TOOL_REQUEST -> OUTPUT).
+ * @file prompt.ts
+ * @description System prompts and reasoning harness configuration for the Agent SDK.
  */
 
-/**
- * Valid pipeline step types supported by the reasoning harness.
- */
-export type AgentStepType =
-    | 'INITIAL'
-    | 'THINK'
-    | 'ANALYSE'
-    | 'TOOL_REQUEST'
-    | 'OUTPUT';
-
-/**
- * Interface representing the JSON structure expected from the LLM at each reasoning step.
- */
-export interface AgentStepPayload {
-    /** The current step in the reasoning pipeline */
-    step: AgentStepType | string;
-    /** The thought process or reasoning text for this step */
-    text?: string;
-    /** Name of the tool to invoke when step is 'TOOL_REQUEST' */
-    functionName?: string;
-    /** Argument/input payload passed to the requested tool */
-    input?: string;
-}
+import type { ITool } from '../tools/types.js';
 
 /**
  * Base harness system prompt enforcing structured step-by-step reasoning
@@ -86,6 +61,24 @@ Strict Output Format:
   "step": "INITIAL" | "THINK" | "TOOL_REQUEST" | "ANALYSE" | "OUTPUT",
   "text": "<Description or thought process>",
   "functionName": "<Function name when step is TOOL_REQUEST>",
-  "input": "<Function input argument when step is TOOL_REQUEST>"
+  "input": "<Function input argument or JSON string when step is TOOL_REQUEST>"
 }
-`;
+`.trim();
+
+/**
+ * Compiles a list of tools into a stringified JSON schema block for the system prompt.
+ */
+export function formatToolSignatures(tools: Iterable<ITool>): string {
+    const toolArray = Array.from(tools);
+    if (toolArray.length === 0) {
+        return 'None';
+    }
+
+    return toolArray
+        .map(t => JSON.stringify({
+            functionName: t.name,
+            functionDescription: t.description,
+            functionDoc: t.doc ?? 'No signature doc provided'
+        }))
+        .join('\n');
+}
