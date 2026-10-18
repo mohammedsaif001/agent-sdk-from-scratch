@@ -1,0 +1,30 @@
+{
+  "name": "agent-sdk-from-scratch",
+  "version": "1.0.0",
+  "description": "A lightweight, modular AI agent SDK built from scratch with TypeScript and OpenAI",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "agent",
+    "llm",
+    "sdk",
+    "openai",
+    "typescript"
+  ],
+  "author": "Mohammed Saif",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "dotenv": "^18.0.8",
+    "openai": "^7.38.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
